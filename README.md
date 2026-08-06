@@ -200,5 +200,5 @@ docs/        architecture diagram (HTML + PNG)
 ## Security
 
 No credentials, tokens, model weights, or private hostnames are stored in this repository.
-Operational secrets live in Bitwarden Secrets Manager. Both endpoints are **unauthenticated
-plain HTTP** and are intended for a trusted LAN only — do not expose them to the internet.
+Both endpoints are **unauthenticated plain HTTP** and are intended for a trusted LAN only —
+do not expose them to the internet.
