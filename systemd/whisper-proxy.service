@@ -1,0 +1,25 @@
+[Unit]
+Description=Whisper OpenAI-compatible proxy (:8081) -> FLM ASR on NPU (:8090)
+After=network-online.target flm-asr.service
+Wants=network-online.target
+Requires=flm-asr.service
+
+[Service]
+Type=simple
+User=rahlquist
+Group=rahlquist
+WorkingDirectory=/home/rahlquist/whisper-models
+# STT backend: FLM ASR on the NPU. BACKEND_PATH switches the proxy from
+# whisper.cpp's /inference route to FLM's OpenAI-compatible route.
+Environment=BACKEND_URL=http://127.0.0.1:8090
+Environment=BACKEND_PATH=/v1/audio/transcriptions
+Environment=PROXY_PORT=8081
+Environment=DEFAULT_LANGUAGE=en
+Environment=STRIP_NEWLINES=1
+ExecStart=/home/rahlquist/whisper-env/bin/python3 /home/rahlquist/whisper-models/whisper_openai_proxy.py
+Restart=on-failure
+RestartSec=3
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

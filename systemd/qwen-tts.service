@@ -1,0 +1,20 @@
+[Unit]
+Description=Qwen3-TTS 1.7B (qwentts.cpp, Vulkan) on Radeon 840M iGPU - TTS service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rahlquist
+Group=rahlquist
+WorkingDirectory=/home/rahlquist/tts-test/qwentts.cpp/build
+ExecStart=/home/rahlquist/tts-test/qwentts.cpp/build/tts-server \
+  --model /home/rahlquist/tts-test/models/qwen3-tts-0.6b/qwen-talker-1.7b-base-Q8_0.gguf \
+  --codec /home/rahlquist/tts-test/models/qwen3-tts-0.6b/qwen-tokenizer-12hz-Q8_0.gguf \
+  --host 0.0.0.0 --port 8092 --alias qwen3-tts-1.7b
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

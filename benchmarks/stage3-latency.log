@@ -1,0 +1,37 @@
+2026-08-06 12:09:44  ========================================================================
+2026-08-06 12:09:44  STAGE 3 — concurrency + liveness measurement
+2026-08-06 12:09:44  ========================================================================
+2026-08-06 12:09:44  --- IDLE BASELINES (sequential) ---
+2026-08-06 12:09:56  STT idle (2.5s audio, NPU)         n=5  mean=2.395s  min=2.351s  max=2.511s
+2026-08-06 12:10:02  TTS idle (wav, iGPU)               n=5  mean=1.234s  min=1.062s  max=1.449s
+2026-08-06 12:10:09  TTS streaming (pcm)                n=5  TTFA_mean=0.237s  TTFA_min=0.199s  total_mean=1.318s
+2026-08-06 12:10:09  --- TEST 1: SIMULTANEOUS TTS + STT (cross-contention) ---
+2026-08-06 12:10:17  simultaneous wall=7.929s
+2026-08-06 12:10:17    STT concurrent mean=5.453s (idle 2.395s, delta +127.6%)
+2026-08-06 12:10:17    TTS concurrent mean=3.041s (idle 1.234s, delta +146.4%)
+2026-08-06 12:10:17  --- TEST 2: TTS FLOOD x5 (max-batch=1 -> expect serialize) ---
+2026-08-06 12:10:24  TTS flood x5                       n=5  wall=7.748s  mean=4.699s  max=7.747s
+2026-08-06 12:10:24    STT during TTS flood:
+2026-08-06 12:10:32    STT while TTS flooded            n=3  mean=2.417s  min=2.349s  max=2.532s
+2026-08-06 12:10:32  --- TEST 3: STT FLOOD x5 (NPU q-len 10) ---
+2026-08-06 12:10:45  STT flood x5                       n=5  wall=13.009s  mean=7.917s  max=13.009s
+2026-08-06 12:10:45    TTS during STT flood:
+2026-08-06 12:10:49    TTS while STT flooded            n=3  mean=1.305s  min=1.214s  max=1.397s
+2026-08-06 12:10:49  STAGE 3 harness complete.
+2026-08-06 12:11:35  ========================================================================
+2026-08-06 12:11:35  STAGE 3b — STRICT 1:1 cross-contention + end-to-end loop
+2026-08-06 12:11:35  ========================================================================
+2026-08-06 12:11:54  STT idle          mean=2.379s
+2026-08-06 12:11:54  TTS idle  total   mean=1.404s   TTFA mean=0.202s
+2026-08-06 12:11:54  --- 1 STT + 1 TTS strictly simultaneous, 5 rounds ---
+2026-08-06 12:12:09  STT concurrent    mean=2.422s  (idle 2.379s) delta +1.8%
+2026-08-06 12:12:09  TTS concurrent    mean=1.450s  (idle 1.404s) delta +3.3%
+2026-08-06 12:12:09  TTS TTFA concur   mean=0.203s  (idle 0.202s) delta +0.8%
+2026-08-06 12:12:09  --- END-TO-END conversational loop (slug audio portion) ---
+2026-08-06 12:12:13    round 1: 3.752s (STT complete -> TTS first audio)
+2026-08-06 12:12:16    round 2: 3.667s (STT complete -> TTS first audio)
+2026-08-06 12:12:20    round 3: 3.852s (STT complete -> TTS first audio)
+2026-08-06 12:12:24    round 4: 3.647s (STT complete -> TTS first audio)
+2026-08-06 12:12:28    round 5: 3.727s (STT complete -> TTS first audio)
+2026-08-06 12:12:28  E2E slug audio    mean=3.729s  min=3.647s   [target <1.000s]
+2026-08-06 12:12:28  STAGE 3b complete.

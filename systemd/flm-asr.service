@@ -1,0 +1,22 @@
+[Unit]
+Description=FLM ASR (Whisper large-v3-turbo) on AMD XDNA2 NPU - STT backend
+Documentation=https://github.com/FastFlowLM/FastFlowLM
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rahlquist
+Group=rahlquist
+WorkingDirectory=/home/rahlquist
+# FLM requires unlimited locked memory to initialize the NPU (validate fails at 8MB).
+LimitMEMLOCK=infinity
+# ASR + co-loaded llama3.2:1b (FLM --asr requires an LLM tag alongside the ASR model).
+# Bound to localhost: the whisper-proxy on :8081 is the LAN-facing interface.
+ExecStart=/usr/bin/flm serve whisper-v3:turbo --asr 1 --host 127.0.0.1 --port 8090
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
