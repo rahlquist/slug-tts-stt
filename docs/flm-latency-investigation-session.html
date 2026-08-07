@@ -1,0 +1,145 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>slug FLM ASR Latency Investigation — Session Record</title>
+<style>
+@page { size: A4; margin: 18mm 16mm 18mm 16mm; }
+body { font-family: Arial, sans-serif; color:#18212b; line-height:1.42; font-size:10pt; }
+h1 { color:#102a43; font-size:24pt; border-bottom:3px solid #2f80ed; padding-bottom:8px; }
+h2 { color:#155e75; border-bottom:1px solid #b9d6e5; padding-bottom:4px; margin-top:24px; }
+h3 { color:#334e68; margin-top:18px; }
+.meta { background:#eef6ff; border-left:4px solid #2f80ed; padding:10px 12px; }
+.warn { background:#fff7e6; border-left:4px solid #f2994a; padding:10px 12px; }
+.ok { background:#edf9f0; border-left:4px solid #27ae60; padding:10px 12px; }
+.fail { background:#fff0f0; border-left:4px solid #c0392b; padding:10px 12px; }
+pre { background:#f4f6f8; border:1px solid #d9e2ec; padding:8px; white-space:pre-wrap; font-family:monospace; font-size:8pt; }
+code { font-family:monospace; background:#f1f3f5; padding:1px 3px; }
+table { width:100%; border-collapse:collapse; margin:10px 0 16px; }
+th,td { border:1px solid #bcccdc; padding:5px 6px; vertical-align:top; }
+th { background:#d9eaf7; }
+.small { font-size:8.5pt; color:#52606d; }
+.pagebreak { page-break-before:always; }
+</style></head><body>
+<h1>slug / FLM ASR Latency Investigation</h1>
+<div class="meta"><b>Session record</b><br>
+Project: <code>rahlquist/slug-tts-stt</code><br>
+Scope: user request beginning “In the process of setting up slug you asserted FLM has…” through restoration and update review.<br>
+Hosts: <code>slug.home.lan</code> (Krackan voice edge), Hermes execution host, upstream FastFlowLM source.<br>
+Status: investigation complete; production stack restored; no production binary or persistent unit changed by instrumentation.</div>
+
+<h2>1. User request and investigation objectives</h2>
+<p>The user asked whether the previously reported approximately 1.6–2.2 second FLM ASR delay could be narrowed down, specifically requesting:</p>
+<ul><li>Determine how long the 3,000 mel frames take to compute.</li><li>Thoroughly inspect <code>audio_chunk</code>.</li><li>Consult source code, documentation, bug tickets, and upstream material.</li><li>Build and run an instrumented FLM build if possible.</li><li>Perform orderly tests to locate the slowdown.</li><li>Restore FLM to its pre-test state, with instrumentation removed or disabled.</li><li>Check current FLM, ROCm, AMD/XDNA/XRT updates afterward.</li><li>Document all test stages and code alterations so results are auditable.</li></ul>
+
+<h2>2. Baseline inherited from the earlier slug deployment</h2>
+<p>The existing Option B architecture was:</p>
+<pre>STT: client → slug:8081 whisper-proxy → slug:8090 FLM Whisper on XDNA2 NPU
+TTS: client → slug:8092 qwentts.cpp Qwen3-TTS on Radeon 840M iGPU</pre>
+<p>Earlier measured values were:</p>
+<table><tr><th>Test</th><th>Result</th></tr>
+<tr><td>0.5 s audio</td><td>approximately 2.16–2.3 s</td></tr>
+<tr><td>2.5 s audio</td><td>approximately 2.32–2.4 s</td></tr>
+<tr><td>11 s audio</td><td>approximately 2.7–2.8 s</td></tr>
+<tr><td>Direct FLM vs proxy</td><td>effectively identical</td></tr>
+<tr><td>Strict simultaneous STT + TTS</td><td>STT +1.8%; TTS +3.3%; TTFA +0.8%</td></tr>
+<tr><td>End-to-end target</td><td>3.73 s vs working target &lt;1 s</td></tr></table>
+<p>The earlier hypothesis was “fixed overhead inside FLM.” This investigation was designed to split that overhead into audio loading, mel preprocessing, NPU encoding, and token decoding.</p>
+
+<h2>3. Phase 1 — environment and production-state inspection</h2>
+<p>No production change was made initially. The live service was inspected:</p>
+<pre>FLM v0.9.46
+ExecStart=/usr/bin/flm serve whisper-v3:turbo --asr 1 --host 127.0.0.1 --port 8090
+PID resident for more than 18 hours
+RSS approximately 7.3 GB
+/dev/accel/accel0 open
+LimitMEMLOCK=infinity
+</pre>
+<p>The service defaulted to <code>--pmode performance</code>; <code>--pmode turbo</code> was not present in the persistent unit.</p>
+<p>FLM help exposed the relevant controls: <code>--pmode</code>, <code>--ctx-len</code>, <code>--prefill-chunk-len</code>, <code>--q-len</code>, and <code>--asr</code>.</p>
+
+<h2>4. Phase 2 — tighter direct/proxy latency reproduction</h2>
+<p>A repeatable probe ran five requests per endpoint using the same files and measured wall time with <code>curl</code>.</p>
+<table><tr><th>Audio</th><th>Direct :8090</th><th>Proxy :8081</th><th>Conclusion</th></tr>
+<tr><td>0.5 s</td><td>mean 2.2986 s</td><td>mean 2.2434 s</td><td>no material proxy cost</td></tr>
+<tr><td>2.5 s</td><td>mean 2.3693 s</td><td>mean 2.3523 s</td><td>no material proxy cost</td></tr>
+<tr><td>11 s</td><td>mean 2.7747 s</td><td>mean 2.7550 s</td><td>no material proxy cost</td></tr></table>
+<p>All requests returned HTTP 200. Repeated requests stayed flat, ruling out per-request model reload.</p>
+
+<h2>5. Phase 3 — source review</h2>
+<h3>5.1 Fixed 30-second Whisper window</h3>
+<p>Current upstream source was cloned from <code>ROCm/FastFlowLM</code> at commit:</p>
+<pre>8279cd6786bdd0b4f1ee8e9107c4a436322ce40b
+Merge pull request #658 from ROCm/repo-transfer</pre>
+<p>In <code>src/common/whisper/modeling_whisper_audio.cpp</code>:</p>
+<pre>const int CHUNK_LENGTH = 30;
+const int N_SAMPLES = SAMPLE_RATE * CHUNK_LENGTH; // 480000
+
+if (x.size() &lt; N_SAMPLES)
+    x.resize(N_SAMPLES, 0.0f);
+
+int n_frames = (...) / HOP_LENGTH + 1; // 3000</pre>
+<p>The mel path therefore computes a fixed 128×3000 feature tensor for short input. In the source, the work is clearly separate from <code>encode_audio()</code>.</p>
+<h3>5.2 <code>audio_chunk</code> construction bug</h3>
+<p>The original code was:</p>
+<pre>std::vector&lt;float&gt; audio_chunk(l_this_round);
+audio_chunk.insert(audio_chunk.begin(),
+    this-&gt;audio_buffer.data() + current_idx,
+    this-&gt;audio_buffer.data() + current_idx + l_this_round);</pre>
+<p>This constructs <code>l_this_round</code> zeroes and then inserts the real audio before them. Measured vector sizes:</p>
+<table><tr><th>Input</th><th>Real samples</th><th>Vector after original insert</th></tr>
+<tr><td>0.5 s</td><td>8,000</td><td>16,000</td></tr><tr><td>2.5 s</td><td>40,000</td><td>80,000</td></tr><tr><td>11 s</td><td>176,000</td><td>352,000</td></tr></table>
+<p>This can cause incorrect truncation for longer inputs when preprocessing limits the vector to the 30-second window. It is a real correctness bug, but testing the corrected allocation showed it is not the 2.2-second latency cause.</p>
+<h3>5.3 Source audio loading</h3>
+<p>The source decodes the request from memory with FFmpeg, resamples to 16 kHz, converts to mono, and normalizes to float. That path was separately timed.</p>
+
+<h2>6. Phase 4 — 30-second boundary test</h2>
+<p>Temporary 29.5-second and 30.5-second WAVs were generated and sent directly to FLM:</p>
+<table><tr><th>Input</th><th>Measured latency</th></tr><tr><td>29.5 s</td><td>2.23–2.43 s</td></tr><tr><td>30.5 s</td><td>7.29–7.32 s</td></tr></table>
+<p>This sharp step confirms the sliding/multiple-window path. It is consistent with a fixed 30-second encoder invocation per window.</p>
+
+<h2>7. Phase 5 — instrumented FLM build</h2>
+<h3>7.1 Build process</h3>
+<ul><li>Cloned current upstream FastFlowLM source and initialized submodules.</li><li>Configured a separate CMake build under <code>/tmp/FastFlowLM/src/build-instrumented</code>.</li><li>Used CMake, GCC, FFmpeg, FFTW, Boost, XRT, and AMD XDNA runtime already present on slug.</li><li>The current tokenizer submodule required Rust/Cargo; Rust was installed user-local only, used for the build, then removed.</li><li>The first parallel build hit a tokenizer generation race. A serial <code>make -j1</code> completed successfully.</li></ul>
+<h3>7.2 Exact instrumentation</h3>
+<p>Temporary edits were made only to <code>src/common/whisper/modeling_whisper.cpp</code>:</p>
+<ul><li>Added <code>&lt;chrono&gt;</code> and a monotonic millisecond helper.</li><li>Timed vector audio loading/resampling.</li><li>Printed chunk source size and post-construction size with prefix <code>[FLM-PROBE]</code>.</li><li>Timed <code>_preprocess_audio()</code>.</li><li>Timed <code>whisper_engine-&gt;encode_audio()</code>.</li><li>Timed decoder execution.</li></ul>
+<p>The production <code>/usr/bin/flm</code> was not edited or replaced.</p>
+<h3>7.3 Instrumented results</h3>
+<table><tr><th>Stage</th><th>0.5 s</th><th>2.5 s</th><th>11 s</th></tr>
+<tr><td>Audio load/decode/resample</td><td>1.3 ms</td><td>4.3 ms</td><td>4.3 ms</td></tr>
+<tr><td>Mel preprocessing, all 3,000 frames</td><td>5.5 ms</td><td>6.4 ms</td><td>6.4 ms</td></tr>
+<tr><td>NPU <code>encode_audio()</code></td><td>2365.8 ms</td><td>2186.2 ms</td><td>2183.2 ms</td></tr>
+<tr><td>Token decode</td><td>100.6 ms</td><td>218.5 ms</td><td>613.1 ms</td></tr>
+<tr><td>HTTP total</td><td>2474.1 ms</td><td>2416.6 ms</td><td>2809.0 ms</td></tr></table>
+<div class="ok"><b>Finding:</b> the fixed latency floor is the NPU Whisper encoder processing the fixed 30-second acoustic tensor. The 3,000 mel frames take approximately 6 ms, not 2 seconds.</div>
+
+<h2>8. Phase 6 — corrected <code>audio_chunk</code> experiment</h2>
+<p>The instrumented source was changed temporarily to:</p>
+<pre>std::vector&lt;float&gt; audio_chunk(
+    this-&gt;audio_buffer.begin() + current_idx,
+    this-&gt;audio_buffer.begin() + current_idx + l_this_round);</pre>
+<p>The corrected vector sizes became 8,000 / 40,000 / 176,000 samples. Encoder timings remained approximately 2.15–2.38 seconds. End-to-end timing did not materially improve. This separates the correctness bug from the performance bottleneck.</p>
+
+<h2>9. Phase 7 — power-mode experiment</h2>
+<p>The temporary instrumented binary was run with <code>--pmode turbo</code>. A 0.5-second request measured approximately 2.37 seconds of encoder time, statistically indistinguishable from performance mode at approximately 2.38 seconds. Turbo mode is not the lever.</p>
+
+<h2>10. Upstream documentation and issue review</h2>
+<p>Reviewed:</p>
+<ul><li>FastFlowLM Whisper documentation: <a href="https://github.com/ROCm/FastFlowLM/blob/main/docs/docs/models/whisper.md">docs/models/whisper.md</a></li><li>FastFlowLM issue #637: <a href="https://github.com/ROCm/FastFlowLM/issues/637">ASR response_format/timestamps</a></li><li>Current ROCm/FastFlowLM source and CMake build files.</li></ul>
+<p>Issue #637 confirms the ASR engine internally performs timestamp-aware sliding-window work, while the REST layer currently returns only minimal text. No upstream documentation found publishes a latency baseline for this path. Karen’s independent review agreed that the full-window encoder path is the primary hypothesis and that the chunk construction is a separate bug.</p>
+
+<h2>11. Production restoration and verification</h2>
+<p>After testing:</p>
+<ul><li>Stopped the temporary instrumented process.</li><li>Removed temporary source, build, logs, test files, and user-local Rust/Cargo installation.</li><li>Started the original systemd units: <code>flm-asr</code>, <code>qwen-tts</code>, <code>whisper-proxy</code>.</li><li>Confirmed the production binary hash remained:</li></ul>
+<pre>8f5a919fc39d10d71135baac863ae2eee5cd526ddd01e64e6c504a0392e970f4  /usr/bin/flm</pre>
+<table><tr><th>Verification</th><th>Result</th></tr><tr><td>flm-asr</td><td>active, enabled</td></tr><tr><td>qwen-tts</td><td>active, enabled</td></tr><tr><td>whisper-proxy</td><td>active, enabled</td></tr><tr><td>Ports 8081/8090/8092</td><td>listening</td></tr><tr><td>Voices</td><td>trimmed and freeman restored</td></tr><tr><td><code>flm validate</code></td><td>clean; memlock infinity; NPU firmware 1.1.2.64; amdxdna 0.10</td></tr><tr><td>Direct and proxy STT</td><td>HTTP 200 and transcripts returned</td></tr></table>
+
+<h2>12. Update review</h2>
+<table><tr><th>Component</th><th>Installed state</th></tr><tr><td>FastFlowLM</td><td>0.9.46-1.1</td></tr><tr><td>XRT</td><td>2.21.75-10.1</td></tr><tr><td>XRT AMD XDNA plugin</td><td>2.21.75-2.1</td></tr><tr><td>ROCm</td><td>7.2.4</td></tr><tr><td>Mesa</td><td>26.1.6</td></tr><tr><td>Kernel</td><td>7.2.0-rc6-1-cachyos-rc</td></tr><tr><td>NPU firmware</td><td>1.1.2.64</td></tr><tr><td>amdxdna</td><td>0.10</td></tr></table>
+<p>FastFlowLM has moved from the original repository to the AMD-owned <code>ROCm/FastFlowLM</code> repository. Newer AMD Ryzen AI documentation advertises newer Ubuntu-oriented XRT/XDNA packages, but they were not installed because they are not verified drop-in replacements for this Arch/CachyOS stack. No update was applied.</p>
+
+<h2>13. Final findings</h2>
+<ol><li>Mel computation for 3,000 frames is approximately <b>6 ms</b>.</li><li>The fixed ~2.2-second cost is the NPU Whisper encoder.</li><li>Short input is padded to a fixed 30-second, 3,000-frame representation.</li><li>The 30-second boundary produces a large multi-window latency jump.</li><li>The original <code>audio_chunk</code> construction doubles the vector and can lose tails on longer input; it should be fixed upstream.</li><li>Fixing <code>audio_chunk</code> does not remove the encoder latency.</li><li>Proxy, container format, resampling, model reload, and turbo power mode are not the dominant causes.</li><li>The most promising optimizations are dynamic/streaming encoder handling, incremental state, or a runtime/model path that avoids a full fixed 30-second encoder invocation.</li></ol>
+
+<h2>14. Provenance and reproducibility</h2>
+<ul><li><b>Measured:</b> all latency tables, stage timings, vector sizes, service hashes/states, endpoint results.</li><li><b>Source-derived:</b> 30-second padding, 3,000-frame mel tensor, encoder call order, chunk construction semantics.</li><li><b>Upstream evidence:</b> FastFlowLM source, Whisper documentation, issue #637, current repository commit listed above.</li><li><b>Not claimed:</b> no unverified “fix” was installed; no production binary was replaced; no vendor timing claim was treated as a measurement.</li></ul>
+<p class="small">Generated as a sanitized project record. Credentials, tokens, secret-store identifiers, and private authentication material are intentionally excluded.</p>
+</body></html>

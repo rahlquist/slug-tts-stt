@@ -51,6 +51,13 @@ RAM footprint ≈ 10 GB of 30 GB.
 
 All figures measured on-host, 2026-08-06. Raw log: [`benchmarks/stage3-latency.log`](benchmarks/stage3-latency.log).
 
+### Detailed FLM latency investigation
+
+The complete sanitized technical record of the FLM ASR latency investigation — including source review, `audio_chunk` analysis, instrumented-build stage timings, orderly test procedure, restoration checks, and update review — is available as [`docs/flm-latency-investigation-session.pdf`](docs/flm-latency-investigation-session.pdf) and its browsable source [`docs/flm-latency-investigation-session.html`](docs/flm-latency-investigation-session.html).
+
+Key result: the 3,000-frame mel calculation took approximately **6 ms**; the fixed ~2.2 s floor was dominated by the NPU Whisper `encode_audio()` stage on FLM's fixed 30-second acoustic window.
+
+
 ### Latency
 
 | Path | Metric | Value |
