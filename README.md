@@ -155,17 +155,41 @@ curl -X POST http://<host>:8092/v1/audio/speech \
 
 ### Voice cloning (zero-shot)
 
+There are no built-in voices — a voice *is* a reference clip you register, and the
+model clones it. The bundled **`scripts/slug-voice-push`** does the durable version:
+it converts the sample (mono 16 kHz), copies it into the voice store on the TTS
+host, registers the voice via the API, and verifies it actually speaks.
+
 ```bash
-python3 - <<'PY'
-import base64, json, urllib.request
-wav = base64.b64encode(open('reference.wav','rb').read()).decode()
-body = json.dumps({'name': 'myvoice', 'wav_b64': wav}).encode()
-req = urllib.request.Request('http://<host>:8092/v1/audio/voices', data=body,
-                             headers={'Content-Type': 'application/json'}, method='POST')
-print(urllib.request.urlopen(req, timeout=120).read().decode())
-PY
-# then pass  "voice": "myvoice"  in the speech request
+# ICL clone mode (supply the exact transcript of the clip — better fidelity)
+slug-voice-push myvoice ~/Downloads/reference.wav \
+    --ref-text "the exact words spoken in the recording"
+
+# base clone mode (no transcript)
+slug-voice-push myvoice ~/Downloads/reference.wav --no-ref-text
+
+# inspect what is live vs what is persisted
+slug-voice-push --list
+
+# make it the default Hermes TTS voice
+slug-voice-push --set-default myvoice
 ```
+
+**Reboot persistence (important).** Registered voices live in the server's memory
+only. A restart or reboot silently drops them, and TTS then returns **HTTP 200 with
+zero bytes** — no error. `qwen-tts.service` runs `scripts/slug-voice-restore` as
+`ExecStartPost`, which re-registers every voice from `~/.config/slug-voices/` on the
+TTS host. `slug-voice-push` writes the sample + metadata there, so a voice added
+once survives every reboot unattended. The leading `-` on that line means a restore
+failure can never take the TTS service down.
+
+**ref_text must match.** A transcript from a *different* clip makes ICL run away —
+measured 163.8 s of noise for a 10-word line versus 4.0 s correct. `slug-voice-push`
+detects the runaway (audio far longer than the probe implies) and refuses to leave a
+broken voice configured.
+
+Then speak it by passing `"voice": "myvoice"` in the speech request, or set it as the
+Hermes default above.
 
 ---
 
@@ -184,8 +208,17 @@ PY
    so existing whisper.cpp deployments are unaffected).
 6. **systemd `Wants=` cannot be reliably cleared from a drop-in** when the same file also
    adds new `Wants=` entries — replace the unit file instead.
-7. **Don't forget the firewall.** A `0.0.0.0` bind still fails from the LAN if `ufw` has no
-   rule for the port; symptom is a hang, not a refusal.
+8. **Connecting to Hermes TTS.** `hermes config set tts.provider openai`,
+   `tts.openai.base_url http://<host>:8092/v1`, `tts.openai.voice <name>` (or empty
+   for the base voice), `tts.openai.api_key not-needed`. The `text_to_speech` tool
+   derives its output format from the **file extension** and defaults to `mp3`, which
+   this backend rejects (`400 response_format must be 'pcm' or 'wav'`) — pass an
+   `output_path` ending in `.wav`. Streaming voice replies are unaffected (they
+   hardcode `pcm`). The model name Hermes sends (`gpt-4o-mini-tts`) is ignored by the
+   server.
+9. **Voices vanish on restart.** Covered above — use `slug-voice-push` (writes to the
+   reboot-proof store) and rely on `slug-voice-restore` via `ExecStartPost`. A wrong
+   voice name returns HTTP 200 with 0 bytes, so verify by RMS, not by status code.
 
 ## Repository layout
 
@@ -193,6 +226,8 @@ PY
 systemd/     flm-asr, qwen-tts, whisper-proxy unit files
 config/      memlock limits drop-in
 scripts/     whisper_openai_proxy.py (OpenAI shape → backend, route-configurable)
+             slug-voice-push      (install a WAV as a reboot-proof cloned voice)
+             slug-voice-restore  (ExecStartPost hook: re-register voices at boot)
 benchmarks/  measurement harnesses + raw latency log
 docs/        architecture diagram (HTML + PNG)
 ```

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Re-register every saved voice with the local qwentts server.
+
+Run by systemd as ExecStartPost of qwen-tts.service: registered voices are held
+in memory only, so without this every restart silently drops them and Hermes TTS
+returns HTTP 200 with zero bytes.
+
+Store layout (self-contained on this host):
+    ~/.config/slug-voices/<name>.json   {"name","wav","ref_text"}
+    ~/.config/slug-voices/<name>.wav    the reference sample
+"""
+import base64, json, math, os, socket, struct, sys, time
+import urllib.error, urllib.request
+
+HOST = "http://127.0.0.1:8092"
+STORE = os.path.expanduser("~/.config/slug-voices")
+READY_TIMEOUT = 150          # hard cap: never hang the unit's startup
+LOG = os.path.expanduser("~/tts-test/voice-restore.log")
+
+
+def log(msg):
+    line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def wait_ready(deadline):
+    """Port open is necessary but not sufficient - the model loads after bind."""
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 8092), timeout=2):
+                pass
+        except OSError:
+            time.sleep(2)
+            continue
+        try:
+            with urllib.request.urlopen(HOST + "/v1/audio/voices", timeout=5):
+                return True
+        except (urllib.error.URLError, OSError):
+            time.sleep(2)
+    return False
+
+
+def rms_of(pcm):
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0, 0
+    s = struct.unpack("<%dh" % n, pcm[: n * 2])
+    return math.sqrt(sum(x * x for x in s) / n), max(abs(x) for x in s)
+
+
+def post(path, body, timeout=180):
+    req = urllib.request.Request(
+        HOST + path, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        return 0, str(e).encode()
+
+
+def main():
+    if not os.path.isdir(STORE):
+        log("no voice store at %s - nothing to restore" % STORE)
+        return 0
+    metas = sorted(f for f in os.listdir(STORE) if f.endswith(".json"))
+    if not metas:
+        log("voice store empty - nothing to restore")
+        return 0
+
+    deadline = time.time() + READY_TIMEOUT
+    if not wait_ready(deadline):
+        log("ERROR server not ready within %ds - voices NOT restored" % READY_TIMEOUT)
+        return 1
+
+    failed = 0
+    for fn in metas:
+        try:
+            m = json.load(open(os.path.join(STORE, fn)))
+        except (OSError, ValueError) as e:
+            log("SKIP %s - unreadable (%s)" % (fn, e))
+            failed += 1
+            continue
+
+        wav = m.get("wav", "")
+        if not os.path.isabs(wav):
+            wav = os.path.join(STORE, wav)
+        if not os.path.isfile(wav):
+            log("SKIP %s - sample missing: %s" % (m.get("name"), wav))
+            failed += 1
+            continue
+
+        body = {"name": m["name"],
+                "wav_b64": base64.b64encode(open(wav, "rb").read()).decode()}
+        if m.get("ref_text"):
+            body["ref_text"] = m["ref_text"]
+
+        code, raw = post("/v1/audio/voices", body)
+        if code != 200:
+            log("FAIL %s - HTTP %d %s" % (m["name"], code, raw[:120].decode(errors="replace")))
+            failed += 1
+            continue
+
+        # a bad voice yields 200 + 0 bytes, so prove it actually speaks
+        code2, audio = post("/v1/audio/speech",
+                            {"model": "qwen3-tts-1.7b", "input": "voice check",
+                             "voice": m["name"], "response_format": "pcm"})
+        rms, peak = rms_of(audio)
+        if code2 == 200 and rms > 200 and peak > 2000:
+            log("OK   %s (RMS %.0f, %.1fs sample)" % (m["name"], rms, len(audio) / 2 / 24000))
+        else:
+            log("FAIL %s registered but silent (HTTP %d, %d bytes, RMS %.0f)"
+                % (m["name"], code2, len(audio), rms))
+            failed += 1
+
+    log("restore complete: %d/%d voices live" % (len(metas) - failed, len(metas)))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

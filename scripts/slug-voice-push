@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""slug-voice-push - install a WAV sample as a reboot-proof cloned voice.
+
+The TTS server keeps registered voices in MEMORY ONLY. Registering over the API
+alone means the voice disappears on the next restart and Hermes goes silent
+(HTTP 200 with zero bytes -- no error). This script does the durable version:
+it copies the sample into the voice store on the TTS host, writes the metadata
+the restore hook reads at boot, registers the voice, and proves it speaks.
+
+    slug-voice-push trimmed ~/Downloads/trimmed.wav \
+        --ref-text "exact words spoken in the clip"
+
+    slug-voice-push myvoice sample.wav --no-ref-text   # base clone
+    slug-voice-push --list
+    slug-voice-push --set-default trimmed
+
+Run it from any host that can ssh/scp to the TTS box.
+
+ref_text enables in-context-learning clone mode, which sounds better -- but it
+MUST be the real transcript of the clip. A mismatched transcript makes the model
+run away: measured 163.8 s of noise for a 10-word line, versus 4.0 s correct.
+This script detects that and refuses to leave a broken voice configured.
+"""
+import argparse, base64, json, math, os, shutil, struct, subprocess, sys, tempfile, wave
+import urllib.error, urllib.request
+
+HOST  = os.environ.get("SLUG_TTS_HOST", "slug.home.lan")
+PORT  = int(os.environ.get("SLUG_TTS_PORT", "8092"))
+STORE = "~/.config/slug-voices"          # on the TTS host
+BASE  = "http://%s:%d" % (HOST, PORT)
+MODEL = "qwen3-tts-1.7b"
+PROBE = "This is the cloned voice speaking a short test line."
+
+
+def die(msg):
+    sys.exit("ERROR: " + msg)
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def api(path, body=None, timeout=300):
+    if body is None:
+        try:
+            with urllib.request.urlopen(BASE + path, timeout=30) as r:
+                return r.status, r.read()
+        except (urllib.error.URLError, OSError) as e:
+            return 0, str(e).encode()
+    req = urllib.request.Request(
+        BASE + path, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        return 0, str(e).encode()
+
+
+def rms_of(pcm):
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0, 0
+    s = struct.unpack("<%dh" % n, pcm[: n * 2])
+    return math.sqrt(sum(x * x for x in s) / n), max(abs(x) for x in s)
+
+
+def wav_info(path):
+    with wave.open(path, "rb") as w:
+        return (w.getframerate(), w.getnchannels(), w.getsampwidth(),
+                w.getnframes() / w.getframerate())
+
+
+def cmd_list():
+    code, raw = api("/v1/audio/voices")
+    live = json.loads(raw).get("voices", []) if code == 200 else []
+    print("live on %s : %s" % (HOST, [v["name"] for v in live] or "(none)"))
+    r = run(["ssh", HOST, "ls %s/*.json 2>/dev/null | xargs -n1 basename 2>/dev/null" % STORE])
+    saved = [x[:-5] for x in r.stdout.split()] if r.stdout.strip() else []
+    print("persisted    : %s" % (saved or "(none)"))
+    missing = set(saved) - {v["name"] for v in live}
+    if missing:
+        print("! saved but not loaded: %s  (run slug-voice-restore on %s)" % (sorted(missing), HOST))
+    orphan = {v["name"] for v in live} - set(saved)
+    if orphan:
+        print("! live but NOT persisted (lost on restart): %s" % sorted(orphan))
+
+
+def cmd_set_default(name):
+    r = run(["hermes", "config", "set", "tts.openai.voice", name])
+    if r.returncode != 0:
+        die("hermes config set failed: " + (r.stderr or r.stdout)[:200])
+    print("hermes tts.openai.voice = %s" % name)
+
+
+def cmd_push(a):
+    src = os.path.abspath(os.path.expanduser(a.wav))
+    if not os.path.isfile(src):
+        die("no such file: " + src)
+
+    tmp = tempfile.mkdtemp(prefix="slugvoice-")
+    upload, dur = src, 0.0
+    try:
+        try:
+            rate, ch, width, dur = wav_info(src)
+            print("sample  : %d Hz, %d ch, %d-bit, %.2f s" % (rate, ch, width * 8, dur))
+            convert = (ch != 1 or width != 2 or rate > 24000)
+        except wave.Error:
+            print("sample  : not plain PCM WAV - converting")
+            convert = True
+
+        if convert:
+            if not shutil.which("ffmpeg"):
+                die("conversion needed but ffmpeg is missing")
+            upload = os.path.join(tmp, "conv.wav")
+            print("convert : -> mono 16 kHz 16-bit PCM")
+            r = run(["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000",
+                     "-c:a", "pcm_s16le", upload])
+            if r.returncode != 0 or not os.path.isfile(upload):
+                die("ffmpeg failed:\n" + r.stderr[-500:])
+            dur = wav_info(upload)[3]
+            print("          %.2f s after convert" % dur)
+
+        if dur < 3:
+            print("  ! very short (<3 s) - clone quality will suffer")
+        if dur > 40:
+            print("  ! long (>40 s); 5-20 s of clean single-speaker speech is ideal")
+
+        ref = "" if a.no_ref_text else (a.ref_text or "")
+        if ref:
+            wps = len(ref.split()) / dur if dur else 0
+            print("ref_text: %d words -> %.2f words/sec" % (len(ref.split()), wps))
+            if not 1.5 <= wps <= 5.0:
+                print("  ! that rate is implausible for speech - transcript likely")
+                print("    belongs to a different clip; expect a runaway. Use --no-ref-text.")
+
+        # --- copy sample + metadata to the TTS host (this is what survives reboot)
+        if run(["ssh", HOST, "mkdir -p %s" % STORE]).returncode != 0:
+            die("cannot create %s on %s" % (STORE, HOST))
+        if run(["scp", "-q", upload, "%s:%s/%s.wav" % (HOST, STORE, a.name)]).returncode != 0:
+            die("scp of sample failed")
+        meta = os.path.join(tmp, a.name + ".json")
+        with open(meta, "w") as f:            # written as a file: no shell quoting
+            json.dump({"name": a.name, "wav": a.name + ".wav", "ref_text": ref}, f, indent=2)
+        if run(["scp", "-q", meta, "%s:%s/%s.json" % (HOST, STORE, a.name)]).returncode != 0:
+            die("scp of metadata failed")
+        print("store   : %s:%s/{%s.wav,%s.json}" % (HOST, STORE, a.name, a.name))
+
+        # --- register
+        print("register: %s" % ("ICL mode (ref_text)" if ref else "base clone (no ref_text)"))
+        body = {"name": a.name,
+                "wav_b64": base64.b64encode(open(upload, "rb").read()).decode()}
+        if ref:
+            body["ref_text"] = ref
+        code, raw = api("/v1/audio/voices", body)
+        print("          HTTP %d %s" % (code, raw.decode(errors="replace").strip()[:160]))
+        if code != 200:
+            die("registration failed")
+
+        # --- verify: audible AND not running away
+        code, audio = api("/v1/audio/speech",
+                          {"model": MODEL, "voice": a.name,
+                           "input": PROBE, "response_format": "pcm"})
+        rms, peak = rms_of(audio)
+        secs = len(audio) / 2 / 24000
+        print("verify  : HTTP %d, %.2f s, RMS %.0f, peak %d" % (code, secs, rms, peak))
+        if not (code == 200 and rms > 200 and peak > 2000):
+            die("registered but silent (200 + 0 bytes is how a bad voice fails)")
+        if secs > 25:
+            print("          ! RUNAWAY: %.0f s for a %d-word line" % (secs, len(PROBE.split())))
+            print("          ! ref_text does not match this clip.")
+            die("re-run with --no-ref-text, or supply the clip's real transcript")
+        print("          PASS - real speech, no runaway")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if a.set_default:
+        cmd_set_default(a.name)
+    print("\n'%s' is registered and persisted. slug-voice-restore re-registers it" % a.name)
+    print("automatically via ExecStartPost on every qwen-tts start.")
+
+
+p = argparse.ArgumentParser(prog="slug-voice-push", description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("name", nargs="?", help="voice name")
+p.add_argument("wav", nargs="?", help="path to the WAV sample")
+p.add_argument("--ref-text", default="", help="exact transcript of the clip (ICL mode)")
+p.add_argument("--no-ref-text", action="store_true", help="base clone; skip ICL")
+p.add_argument("--set-default", action="store_true", help="also set it as the Hermes TTS voice")
+p.add_argument("--list", action="store_true", help="show live vs persisted voices")
+a = p.parse_args()
+
+if a.list:
+    cmd_list()
+elif a.name and a.wav:
+    cmd_push(a)
+elif a.name and a.set_default:
+    cmd_set_default(a.name)
+else:
+    p.print_help()
+    sys.exit(1)

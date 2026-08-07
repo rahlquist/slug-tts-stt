@@ -12,9 +12,13 @@ ExecStart=/home/rahlquist/tts-test/qwentts.cpp/build/tts-server \
   --model /home/rahlquist/tts-test/models/qwen3-tts-0.6b/qwen-talker-1.7b-base-Q8_0.gguf \
   --codec /home/rahlquist/tts-test/models/qwen3-tts-0.6b/qwen-tokenizer-12hz-Q8_0.gguf \
   --host 0.0.0.0 --port 8092 --alias qwen3-tts-1.7b
+# Cloned voices are held in memory only, so every restart drops them and TTS
+# silently returns 200 + 0 bytes. Re-register from ~/.config/slug-voices/.
+# Leading '-' : a restore failure must never take down the TTS service itself.
+ExecStartPost=-/home/rahlquist/.local/bin/slug-voice-restore
 Restart=on-failure
 RestartSec=5
-TimeoutStartSec=180
+TimeoutStartSec=360
 
 [Install]
 WantedBy=multi-user.target
