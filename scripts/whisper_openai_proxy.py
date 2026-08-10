@@ -197,10 +197,16 @@ def _map_response(openai_format, backend_json, duration_sec):
             "text": _norm_text(data.get("text", "")),
             "segments": out_segs,
         })
-    # json (default) and others: OpenAI json returns {"text": ...}
+    # json (default) returns the OpenAI JSON envelope.
     if openai_format == "json":
         return json.dumps({"text": _norm_text(data.get("text", ""))})
-    # text / srt / vtt: return body as-is
+    # The backend may return JSON even when the client requested plain text.
+    # OpenAI-compatible clients (Hermes, VoxType) expect only the transcript
+    # for response_format=text, not the backend envelope.
+    if openai_format == "text":
+        value = data.get("text")
+        return _norm_text(value) if isinstance(value, str) else backend_json
+    # srt / vtt: return the format-specific body as-is.
     return backend_json
 
 
