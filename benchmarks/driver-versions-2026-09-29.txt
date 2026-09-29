@@ -1,0 +1,26 @@
+Slug driver versions — captured 2026-09-29 before re-benchmark
+============================================================
+
+Host: slug.home.lan (AMD Ryzen AI 5 340 / Krackan)
+Kernel: Linux 7.2.8-1-cachyos
+
+--- GPU / Vulkan ---
+Mesa RADV:        26.2.3-arch3.1
+  deviceName:     AMD Radeon 840M Graphics (RADV KRACKAN1)
+  apiVersion:     1.4.354
+  driverVersion:  26.2.3
+ROCm:             7.8.0  (rocm-smi 4.0.0+unknown)
+OpenGL:           4.6 (Compatibility Profile) Mesa 26.2.3-arch3.1
+
+--- NPU ---
+FastFlowLM:       FLM v1.0.6
+/dev/accel:       accel0 (AMD XDNA2, 8 columns)
+
+--- TTS server ---
+qwentts.cpp:      /home/rahlquist/tts-test/qwentts.cpp (no --version flag)
+Model:            qwen3-tts-1.7b (talker q8_0 + tokenizer q8_0)
+
+--- STT backend ---
+whisper model:    whisper-v3:turbo (FLM, NPU2, 623 MB)
+co-load model:    llama3.2:1b (FLM, --asr 1, NPU2, 1.3 GB)
+Proxy:            whisper-proxy :8081 → FLM :8090
