@@ -11,9 +11,11 @@ Group=rahlquist
 WorkingDirectory=/home/rahlquist
 # FLM requires unlimited locked memory to initialize the NPU (validate fails at 8MB).
 LimitMEMLOCK=infinity
-# ASR + co-loaded llama3.2:1b (FLM --asr requires an LLM tag alongside the ASR model).
+# Standalone ASR server mode: flm v0.9.21+ serves whisper without an LLM tag.
+# Passing whisper-v3:turbo as the model tag made flm try (and fail) to load it as
+# an LLM -> "Unsupported model family or non-llm" + a co-loaded llama3.2:1b.
 # Bound to localhost: the whisper-proxy on :8081 is the LAN-facing interface.
-ExecStart=/usr/bin/flm serve whisper-v3:turbo --asr 1 --host 127.0.0.1 --port 8090
+ExecStart=/usr/bin/flm serve --asr 1 --host 127.0.0.1 --port 8090
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=300
